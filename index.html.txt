@@ -1,0 +1,157 @@
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { and, asc, desc, eq, like, or, type SQL } from "drizzle-orm";
+import { createRouter, publicQuery, adminQuery } from "./middleware";
+import { getDb } from "./queries/connection";
+import { brands, categories, products } from "../db/schema";
+import { storage } from "./lib/storage";
+
+const slugify = (value: string) => value.toLowerCase().trim().replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+const categoryFields = {
+  name: z.string().trim().min(2).max(160),
+  description: z.string().max(4000).nullable().optional(),
+  imageAsset: z.string().max(255).nullable().optional(),
+  sortOrder: z.number().int().min(0).max(999).optional(),
+  active: z.boolean().optional(),
+};
+
+const productFields = {
+  categoryId: z.number().int().positive(),
+  brandId: z.number().int().positive().nullable().optional(),
+  name: z.string().trim().min(2).max(220),
+  code: z.string().trim().min(2).max(120),
+  description: z.string().max(8000).nullable().optional(),
+  specifications: z.string().max(8000).nullable().optional(),
+  priceLkr: z.string().regex(/^\d+(\.\d{1,2})?$/).nullable().optional(),
+  stockQty: z.number().int().min(0).max(1000000).nullable().optional(),
+  image1Key: z.string().max(1000).nullable().optional(),
+  image2Key: z.string().max(1000).nullable().optional(),
+  image1Asset: z.string().max(255).nullable().optional(),
+  image2Asset: z.string().max(255).nullable().optional(),
+  featured: z.boolean().optional(),
+  active: z.boolean().optional(),
+};
+
+async function signProducts(rows: Array<{ product: typeof products.$inferSelect; category: typeof categories.$inferSelect | null; brand: typeof brands.$inferSelect | null }>) {
+  const keys = rows.flatMap(({ product }) => [product.image1Key, product.image2Key]).filter((key): key is string => Boolean(key));
+  const urls: Record<string, string> = keys.length ? Object.fromEntries((await storage.getPresignedUrls({ keys })).urls.map((item) => [item.key, item.url])) : {};
+  return rows.map(({ product, category, brand }) => ({
+    ...product,
+    categoryName: category?.name ?? "Uncategorised",
+    categorySlug: category?.slug ?? "",
+    brandName: brand?.name ?? null,
+    image1Url: product.image1Key ? urls[product.image1Key] ?? null : null,
+    image2Url: product.image2Key ? urls[product.image2Key] ?? null : null,
+  }));
+}
+
+async function listProducts(input: { q?: string; category?: string; brandId?: number; stock?: "available" | "out" | "unrecorded"; featured?: boolean; active: boolean; limit: number }) {
+  const filters: SQL[] = [eq(products.active, input.active)];
+  if (input.q) filters.push(or(like(products.name, `%${input.q}%`), like(products.code, `%${input.q}%`), like(products.description, `%${input.q}%`))!);
+  if (input.category) filters.push(eq(categories.slug, input.category));
+  if (input.brandId) filters.push(eq(products.brandId, input.brandId));
+  if (input.featured) filters.push(eq(products.featured, true));
+  const rows = await getDb().select({ product: products, category: categories, brand: brands })
+    .from(products).leftJoin(categories, eq(products.categoryId, categories.id)).leftJoin(brands, eq(products.brandId, brands.id))
+    .where(and(...filters)).orderBy(desc(products.featured), desc(products.createdAt)).limit(input.limit);
+  const filtered = input.stock === "available" ? rows.filter((row) => (row.product.stockQty ?? 0) > 0)
+    : input.stock === "out" ? rows.filter((row) => row.product.stockQty === 0)
+    : input.stock === "unrecorded" ? rows.filter((row) => row.product.stockQty === null) : rows;
+  return signProducts(filtered);
+}
+
+export const catalogRouter = createRouter({
+  categories: publicQuery.query(async () => {
+    const [cats, items] = await Promise.all([
+      getDb().select().from(categories).where(eq(categories.active, true)).orderBy(asc(categories.sortOrder), asc(categories.name)),
+      getDb().select({ categoryId: products.categoryId }).from(products).where(eq(products.active, true)),
+    ]);
+    return cats.map((category) => ({ ...category, productCount: items.filter((item) => item.categoryId === category.id).length }));
+  }),
+
+  brands: publicQuery.input(z.object({ featured: z.boolean().optional() }).optional()).query(async ({ input }) => {
+    const filters = [eq(brands.active, true)];
+    if (input?.featured) filters.push(eq(brands.featured, true));
+    const rows = await getDb().select().from(brands).where(and(...filters)).orderBy(asc(brands.name));
+    const keys = rows.map((brand) => brand.logoKey).filter((key): key is string => Boolean(key));
+    const urls: Record<string, string> = keys.length ? Object.fromEntries((await storage.getPresignedUrls({ keys })).urls.map((item) => [item.key, item.url])) : {};
+    return rows.map((brand) => ({ ...brand, logoUrl: brand.logoKey ? urls[brand.logoKey] ?? null : null }));
+  }),
+
+  products: publicQuery.input(z.object({
+    q: z.string().max(160).optional(), category: z.string().max(180).optional(), brandId: z.number().int().positive().optional(),
+    stock: z.enum(["available", "out", "unrecorded"]).optional(), featured: z.boolean().optional(), limit: z.number().int().min(1).max(100).default(60),
+  })).query(({ input }) => listProducts({ ...input, active: true })),
+
+  product: publicQuery.input(z.object({ slug: z.string().min(1).max(255) })).query(async ({ input }) => {
+    const rows = await getDb().select({ product: products, category: categories, brand: brands }).from(products)
+      .leftJoin(categories, eq(products.categoryId, categories.id)).leftJoin(brands, eq(products.brandId, brands.id))
+      .where(and(eq(products.slug, input.slug), eq(products.active, true))).limit(1);
+    if (!rows[0]) throw new TRPCError({ code: "NOT_FOUND", message: "Product not found" });
+    return (await signProducts(rows))[0];
+  }),
+
+  adminProducts: adminQuery.query(() => listProducts({ active: true, limit: 100 }).then(async (active) => {
+    const inactive = await listProducts({ active: false, limit: 100 });
+    return [...active, ...inactive];
+  })),
+
+  adminCategories: adminQuery.query(() => getDb().select().from(categories).orderBy(asc(categories.sortOrder), asc(categories.name))),
+  adminBrands: adminQuery.query(() => getDb().select().from(brands).orderBy(asc(brands.name))),
+
+  saveCategory: adminQuery.input(z.object({ id: z.number().int().positive().optional(), ...categoryFields })).mutation(async ({ input }) => {
+    const { id, ...data } = input;
+    const values = { ...data, slug: slugify(data.name) };
+    if (id) await getDb().update(categories).set(values).where(eq(categories.id, id));
+    else await getDb().insert(categories).values(values);
+    return { ok: true };
+  }),
+
+  deleteCategory: adminQuery.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
+    const used = await getDb().select({ id: products.id }).from(products).where(eq(products.categoryId, input.id)).limit(1);
+    if (used.length) throw new TRPCError({ code: "BAD_REQUEST", message: "Move or delete this category's products first." });
+    await getDb().delete(categories).where(eq(categories.id, input.id));
+    return { ok: true };
+  }),
+
+  saveBrand: adminQuery.input(z.object({ id: z.number().int().positive().optional(), name: z.string().trim().min(2).max(160), logoKey: z.string().max(1000).nullable().optional(), featured: z.boolean().optional(), active: z.boolean().optional() })).mutation(async ({ input }) => {
+    const { id, ...data } = input;
+    const values = { ...data, slug: slugify(data.name) };
+    if (id) await getDb().update(brands).set(values).where(eq(brands.id, id));
+    else await getDb().insert(brands).values(values);
+    return { ok: true };
+  }),
+
+  deleteBrand: adminQuery.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
+    const used = await getDb().select({ id: products.id }).from(products).where(eq(products.brandId, input.id)).limit(1);
+    if (used.length) throw new TRPCError({ code: "BAD_REQUEST", message: "Remove this brand from its products first." });
+    await getDb().delete(brands).where(eq(brands.id, input.id));
+    return { ok: true };
+  }),
+
+  saveProduct: adminQuery.input(z.object({ id: z.number().int().positive().optional(), ...productFields })).mutation(async ({ input }) => {
+    const { id, ...data } = input;
+    const values = { ...data, slug: `${slugify(data.name)}-${slugify(data.code)}`.slice(0, 250), updatedAt: new Date() };
+    if (id) await getDb().update(products).set(values).where(eq(products.id, id));
+    else await getDb().insert(products).values(values);
+    return { ok: true };
+  }),
+
+  deleteProduct: adminQuery.input(z.object({ id: z.number().int().positive() })).mutation(async ({ input }) => {
+    const [row] = await getDb().select().from(products).where(eq(products.id, input.id)).limit(1);
+    if (!row) return { ok: true };
+    await getDb().delete(products).where(eq(products.id, input.id));
+    const keys = [row.image1Key, row.image2Key].filter((key): key is string => Boolean(key));
+    if (keys.length) await storage.deleteFiles({ fileKeys: keys });
+    return { ok: true };
+  }),
+
+  uploadImage: adminQuery.input(z.object({ name: z.string().min(1).max(240), contentBase64: z.string().max(7_000_000), contentType: z.enum(["image/jpeg", "image/png", "image/webp"]) })).mutation(async ({ input }) => {
+    const bytes = Uint8Array.from(Buffer.from(input.contentBase64, "base64"));
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw new TRPCError({ code: "BAD_REQUEST", message: "Image must be smaller than 5 MB." });
+    const safeName = input.name.replace(/[^a-zA-Z0-9._-]/g, "-");
+    const saved = await storage.uploadFile({ fileContent: bytes, fileName: `products/${Date.now()}-${safeName}`, contentType: input.contentType });
+    return { key: saved.key, size: saved.size };
+  }),
+});
